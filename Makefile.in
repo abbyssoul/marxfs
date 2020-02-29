@@ -1,0 +1,237 @@
+# This is a template for project build automation with make.
+# The actual build system in use if CMake.
+# This file is not meant to be used directly. Please generate a working Makefile for your system via configure script:
+# ./configure [configuration options]
+
+# Project directory layout
+BUILD_DIR = build
+ANALYZE_DIR = build-analyze
+INCLUDE_DIR = include
+SRC_DIR = src
+TEST_DIR = test
+
+MODULE_HEADERS = ${INCLUDE_DIR}/*
+MODULE_SRC = ${SRC_DIR}/*
+
+DEP_INSTALL = $(BUILD_DIR)/conan.lock
+GENERATED_MAKE = $(BUILD_DIR)/CMakeFiles
+
+LIBNAME = lib$(PROJECT).a
+LIB_TAGRET = $(BUILD_DIR)/lib/$(LIBNAME)
+
+TESTNAME = test_$(PROJECT)
+TEST_TAGRET = $(BUILD_DIR)/bin/$(TESTNAME)
+
+DOC_DIR = docs
+DOC_TARGET_HTML = $(DOC_DIR)/html
+
+COVERAGE_REPORT = coverage.info
+CPPCHECK_VERSION = '1.90'
+
+ifdef sanitize
+	SANITIZE = ON
+else
+	SANITIZE = OFF
+endif
+
+ifdef dbg
+	BUILD_TYPE = Debug
+else
+	BUILD_TYPE = Release
+endif
+
+ifdef coverage
+	COVERAGE = ON
+else
+	COVERAGE = OFF
+endif
+
+ifdef profile
+    ENABLE_PROFILE = ON
+else
+    ENABLE_PROFILE = OFF
+endif
+
+ifdef pkgconfig
+	PKG_CONFIG = ON
+else 
+	PKG_CONFIG = OFF
+endif
+
+ifdef CONAN_PROFILE
+    CONAN_INSTALL_PROFILE = --profile ${CONAN_PROFILE}
+endif
+
+
+# First tagret that starts not with '.'' - is a default target to run
+all: lib
+
+
+#-------------------------------------------------------------------------------
+# CMake wrapper
+#-------------------------------------------------------------------------------
+$(DEP_INSTALL):
+	mkdir -p $(BUILD_DIR)
+	conan install -if $(BUILD_DIR) -s build_type=${BUILD_TYPE} . ${CONAN_INSTALL_PROFILE} --build missing
+
+$(GENERATED_MAKE): $(DEP_INSTALL)
+	cd $(BUILD_DIR) && cmake -G ${GENERATOR} -DPROFILE=${ENABLE_PROFILE} -DCOVERAGE=${COVERAGE} -DSANITIZE=${SANITIZE} -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -DPKG_CONFIG=${PKG_CONFIG} ..
+
+#-------------------------------------------------------------------------------
+# Build the project
+#-------------------------------------------------------------------------------
+$(LIB_TAGRET): $(GENERATED_MAKE)
+	cd $(BUILD_DIR) && cmake --build . -j --target $(PROJECT)
+
+lib: $(LIB_TAGRET)
+
+
+#-------------------------------------------------------------------------------
+# Build unit tests
+#-------------------------------------------------------------------------------
+$(TEST_TAGRET): $(GENERATED_MAKE)
+	cd $(BUILD_DIR) && cmake --build . -j --target $(TESTNAME)
+
+tests: $(LIB_TAGRET) $(TEST_TAGRET)
+
+
+.PHONY: test
+test: tests
+	 ./$(TEST_TAGRET)
+
+
+#-------------------------------------------------------------------------------
+# Build examples
+#-------------------------------------------------------------------------------
+.PHONY: examples
+examples: $(LIB_TAGRET)
+	cd $(BUILD_DIR) && cmake --build . -j --target examples
+
+
+#-------------------------------------------------------------------------------
+# Build docxygen documentation
+#-------------------------------------------------------------------------------
+$(DOC_TARGET_HTML):
+	doxygen $(DOC_DIR)/Doxyfile
+
+# Build project doxygen docs doxyfile.inc
+doc: $(MODULE_HEADERS) $(MODULE_SRC) $(DOC_TARGET_HTML)
+
+
+#-------------------------------------------------------------------------------
+# Code Quality Assurance
+#-------------------------------------------------------------------------------
+ANALYZE_MAKE: $(ANALYZE_DIR)
+	mkdir -p $(ANALYZE_DIR)
+	cd $(ANALYZE_DIR) && cmake -DCMAKE_C_COMPILER=$(shell which scan-build) ..
+
+tools/cppcheck:
+	# Getting latest cppcheck
+	# Fix cppcheck version to as master may be is borked sometimes
+	git clone -b ${CPPCHECK_VERSION} --single-branch --depth 1 https://github.com/danmar/cppcheck.git tools/cppcheck
+
+tools/cppcheck/cppcheck: tools/cppcheck
+	$(MAKE) -j2 -C tools/cppcheck cppcheck
+
+
+# TODO: Extra cppcheck options to consider: --enable=style,unusedFunction --inconclusive
+# note: don't use --enable=all, 'cause `style` is too verbose
+.PHONY: cppcheck
+cppcheck: $(MODULE_SRC) tools/cppcheck/cppcheck
+	tools/cppcheck/cppcheck --std=c++20 -D __linux__ -D __x86_64__ --inline-suppr -q --error-exitcode=2 \
+	--enable=warning,performance,portability,information,missingInclude \
+	--report-progress \
+	-I include -i test/ci ${SRC_DIR} ${TEST_DIR} examples
+
+
+.PHONY: cpplint
+cpplint: $(MODULE_SRC)
+	cpplint --recursive --exclude=${TEST_DIR}/ci/* ${INCLUDE_DIR} ${SRC_DIR} ${TEST_DIR}
+
+scan-build: ANALYZE_MAKE
+	cd $(ANALYZE_DIR) && scan-build $(MAKE)
+
+tidy:
+	clang-tidy -checks=llvm-*,modernize-*,clang-analyzer-*,-modernize-pass-by-value -header-filter=.* \
+	${SRC_DIR}/*.cpp -- -I${INCLUDE_DIR} -std=c++17
+
+
+.PHONY: codecheck
+codecheck: cpplint cppcheck #scan-build
+
+
+
+#-------------------------------------------------------------------------------
+# Runtime Quality Control
+#-------------------------------------------------------------------------------
+
+valgrind-memcheck: $(TEST_TAGRET)
+	valgrind --tool=memcheck --trace-children=yes --track-fds=yes --redzone-size=128 --error-exitcode=3 \
+	--leak-check=full --track-origins=yes --show-reachable=yes --show-leak-kinds=all --errors-for-leak-kinds=all --partial-loads-ok=no \
+	$(TEST_TAGRET)
+
+
+# Plugin more valgrind checks when they are available
+.PHONY: verify
+verify: valgrind-memcheck
+
+
+$(COVERAGE_REPORT): $(TEST_TAGRET)
+ifeq ($(COVERAGE), OFF)
+	$(error Coverage info generation is not configured. Run ./configure --enable-coverage to enable)
+else
+	./$(TEST_TAGRET)
+
+	# capture coverage info
+	lcov --directory . --capture --output-file $@
+	# filter out system and test code
+	lcov --remove coverage.info 'test/*' '/usr/*' 'external/*' --output-file $@
+endif
+
+coverage: $(COVERAGE_REPORT)
+
+
+coverage_report: $(COVERAGE_REPORT)
+	lcov --list $(COVERAGE_REPORT)
+
+
+#-------------------------------------------------------------------------------
+# Install
+#-------------------------------------------------------------------------------
+
+.PHONY: install
+install: $(LIB_TAGRET)
+	cd $(BUILD_DIR) && cmake \
+		-DCMAKE_INSTALL_PREFIX=$(PREFIX) \
+		-DSANITIZE=${SANITIZE} \
+		..
+	#cd $(BUILD_DIR) && cmake --build . --target install --config ${BUILD_TYPE}
+	$(MAKE) -C $(BUILD_DIR) install DESTDIR=$(DESTDIR)
+
+
+.PHONY: uninstall
+uninstall:
+	$(RM) -f $(DESTDIR)$(PREFIX)/lib/$(LIBNAME)
+	$(RM) -rf $(DESTDIR)$(PREFIX)/include/$(PROJECT)
+
+
+#-------------------------------------------------------------------------------
+# Packaging
+#-------------------------------------------------------------------------------
+
+.PHONY: debian
+debian:
+	dpkg-buildpackage -d
+
+.PHONY: debian-clean
+debian-clean:
+	dpkg-buildpackage -d -T clean
+
+#-------------------------------------------------------------------------------
+# Cleanup
+#-------------------------------------------------------------------------------
+
+.PHONY: clean
+clean:
+	$(RM) -rf $(DOC_TARGET_HTML) $(BUILD_DIR) $(COVERAGE_REPORT)
+	$(RM) tools/cppcheck/cppcheck
